@@ -7,8 +7,18 @@ from tkinter import ttk, messagebox
 import threading
 import subprocess
 import datetime
+import json
+import time
 import sys
 import os
+
+# 配置文件路径：打包成 onefile exe 后 __file__ 指向临时解压目录（退出即删除），
+# 必须用 exe 所在目录，任务才能持久保存
+if getattr(sys, "frozen", False):
+    APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 
 
 class ShutdownTimer:
@@ -30,9 +40,13 @@ class ShutdownTimer:
         self.warning_shown = False
         self.timer_thread = None
         self.action_var = None  # 在create_widgets中初始化
+        self.task_active = False   # 是否有未完成的定时任务（跨重启持久化）
+        self.end_ts = 0            # 任务到点的绝对时间戳
 
         self.create_widgets()
         self.center_window()
+        self.load_config()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def center_window(self):
         """窗口居中"""
@@ -192,6 +206,9 @@ class ShutdownTimer:
             # 更新界面状态
             self.running = True
             self.warning_shown = False
+            self.end_ts = time.time() + total_seconds
+            self.task_active = True
+            self.save_config()  # 立即落盘，关闭/重开后可恢复
             self.start_btn.config(state=tk.DISABLED)
             self.cancel_btn.config(state=tk.NORMAL)
             self.set_inputs_state(tk.DISABLED)
@@ -243,6 +260,9 @@ class ShutdownTimer:
 
         self.running = False
         self.remaining = 0
+        self.task_active = False  # 用户主动取消，下次启动不再恢复
+        self.end_ts = 0
+        self.save_config()
         self.start_btn.config(state=tk.NORMAL)
         self.cancel_btn.config(state=tk.DISABLED)
         self.set_inputs_state(tk.NORMAL)
@@ -259,6 +279,68 @@ class ShutdownTimer:
         self.shutdown_rb.config(state=state)
         self.hibernate_rb.config(state=state)
 
+    # ---------- 任务持久化 ----------
+    def save_config(self):
+        """保存当前设置与任务状态（active 标记供下次启动恢复）"""
+        cfg = {
+            "action": self.action_var.get(),
+            "mode": self.mode_var.get(),
+            "hour": self.hour_var.get(),
+            "minute": self.minute_var.get(),
+            "second": self.second_var.get(),
+            "time_hour": self.time_hour_var.get(),
+            "time_minute": self.time_minute_var.get(),
+            "active": bool(self.task_active),
+            "end_ts": self.end_ts if self.task_active else 0,
+        }
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def load_config(self):
+        """启动时载入上次设置；若有未完成的定时任务则自动恢复倒计时"""
+        try:
+            if not os.path.isfile(CONFIG_PATH):
+                return
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            self.action_var.set(cfg.get("action", "shutdown"))
+            self.mode_var.set(cfg.get("mode", "countdown"))
+            self.hour_var.set(str(cfg.get("hour", "0")))
+            self.minute_var.set(str(cfg.get("minute", "30")))
+            self.second_var.set(str(cfg.get("second", "0")))
+            self.time_hour_var.set(str(cfg.get("time_hour", "23")))
+            self.time_minute_var.set(str(cfg.get("time_minute", "0")))
+            self.on_mode_change()
+            if cfg.get("active"):
+                remaining = int(float(cfg.get("end_ts", 0)) - time.time())
+                if remaining > 0:
+                    self.end_ts = float(cfg.get("end_ts", 0))
+                    self._resume_task(remaining)
+                else:
+                    # 已到点（任务已执行或错过），不再恢复
+                    self.task_active = False
+                    self.save_config()
+                    self.status_label.config(text="上次定时任务已到点")
+        except Exception:
+            pass
+
+    def _resume_task(self, remaining):
+        """恢复上次未完成的定时任务，用户可点“取消”中止"""
+        self.remaining = remaining
+        self.warning_shown = remaining <= 60
+        self.running = True
+        self.task_active = True
+        self.start_btn.config(state=tk.DISABLED)
+        self.cancel_btn.config(state=tk.NORMAL)
+        self.set_inputs_state(tk.DISABLED)
+        self.timer_thread = threading.Thread(target=self.timer_countdown, daemon=True)
+        self.timer_thread.start()
+        self.status_label.config(text="已恢复上次定时任务")
+        self.update_status()
+
     def timer_countdown(self):
         """后台计时"""
         while self.running and self.remaining > 0:
@@ -274,8 +356,11 @@ class ShutdownTimer:
                 # 倒计时结束，执行操作（休眠时在这里执行）
                 if self.action_var.get() == "hibernate":
                     self.execute_action()
-                # 重置UI状态
+                # 任务已完成，清除恢复标记
                 self.running = False
+                self.task_active = False
+                self.end_ts = 0
+                self.save_config()
                 self.root.after(0, self.reset_ui)
                 break
 
@@ -324,12 +409,14 @@ class ShutdownTimer:
             self.cancel_shutdown()
 
     def on_close(self):
-        """关闭程序"""
+        """关闭程序（任务状态落盘，重开后可恢复）"""
         if self.running:
             action_name = "休眠" if self.action_var.get() == "hibernate" else "关机"
-            if messagebox.askyesno("确认", f"定时任务正在运行，确定要关闭程序吗？\n（{action_name}任务将继续在后台运行）"):
+            if messagebox.askyesno("确认", f"定时任务正在运行，确定要关闭程序吗？\n（重开程序后可查看并取消该任务）"):
+                self.save_config()
                 self.root.destroy()
         else:
+            self.save_config()
             self.root.destroy()
 
     def run(self):
